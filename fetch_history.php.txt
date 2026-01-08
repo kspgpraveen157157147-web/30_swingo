@@ -1,0 +1,141 @@
+<?php
+declare(strict_types=1);
+
+/*
+ * Safe replacement for the original WinGo_30S fetch/save script.
+ * - Uses __DIR__ for save location
+ * - Handles cURL errors and HTTP status codes
+ * - Validates JSON (json_last_error)
+ * - Merges lists using associative lookup
+ * - Writes file atomically with LOCK_EX
+ * - Uses timeouts and allows SSL verification (recommended)
+ */
+
+error_reporting(E_ALL);
+ini_set('display_errors', '0');
+
+header('Content-Type: application/json; charset=utf-8');
+
+$apiUrl = 'https://draw.ar-lottery01.com/WinGo/WinGo_30SEC/GetHistoryIssuePage.json?ts=' . time();
+$saveDir = __DIR__;
+$saveFile = $saveDir . '/WinGo_30S.json';
+$tempSaveFile = $saveFile . '.tmp';
+
+function respond(array $data, int $httpCode = 200): void {
+    http_response_code($httpCode);
+    echo json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// Load saved history (if available and valid)
+$history = ['data' => ['list' => []]];
+if (is_readable($saveFile)) {
+    $raw = @file_get_contents($saveFile);
+    if ($raw !== false) {
+        $decoded = json_decode($raw, true);
+        if (json_last_error() === JSON_ERROR_NONE && isset($decoded['data']['list']) && is_array($decoded['data']['list'])) {
+            $history = $decoded;
+        }
+    }
+}
+$savedList = $history['data']['list'] ?? [];
+
+// Fetch live API with cURL
+$ch = curl_init();
+curl_setopt_array($ch, [
+    CURLOPT_URL => $apiUrl,
+    CURLOPT_RETURNTRANSFER => true,
+    CURLOPT_FOLLOWLOCATION => true,
+    CURLOPT_CONNECTTIMEOUT => 5,
+    CURLOPT_TIMEOUT => 10,
+    // For production you SHOULD enable peer verification. If the remote uses a valid cert, leave these true.
+    CURLOPT_SSL_VERIFYPEER => true,
+    CURLOPT_SSL_VERIFYHOST => 2,
+    // CURLOPT_CAINFO => __DIR__ . '/cacert.pem', // optionally set a local CA bundle
+]);
+
+$apiResponse = curl_exec($ch);
+$curlErr = curl_error($ch);
+$httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+curl_close($ch);
+
+if ($apiResponse === false || $apiResponse === '') {
+    // If we couldn't contact the API, return savedList as the best-effort response
+    // and include an error message.
+    respond([
+        'error' => 'Failed to fetch remote API',
+        'curl_error' => $curlErr,
+        'total_record' => count($savedList),
+        'data' => ['list' => []] // show empty live list, but saved history remains on disk
+    ], 502);
+}
+
+if ($httpCode >= 400) {
+    respond([
+        'error' => 'Remote API returned HTTP ' . $httpCode,
+        'total_record' => count($savedList),
+        'data' => ['list' => []]
+    ], 502);
+}
+
+$apiData = json_decode($apiResponse, true);
+if (json_last_error() !== JSON_ERROR_NONE) {
+    respond([
+        'error' => 'Invalid JSON from remote API: ' . json_last_error_msg(),
+        'total_record' => count($savedList),
+        'data' => ['list' => []]
+    ], 502);
+}
+
+$liveList = $apiData['data']['list'] ?? [];
+if (!is_array($liveList)) {
+    $liveList = [];
+}
+
+// Merge new results efficiently using issueNumber as the key
+$existing = [];
+foreach ($savedList as $item) {
+    if (isset($item['issueNumber'])) {
+        $existing[(string)$item['issueNumber']] = $item;
+    }
+}
+foreach ($liveList as $item) {
+    if (!isset($item['issueNumber'])) {
+        continue;
+    }
+    $key = (string)$item['issueNumber'];
+    if (!isset($existing[$key])) {
+        $existing[$key] = $item;
+    }
+}
+
+// Rebuild savedList and sort descending by numeric issueNumber if possible
+$savedList = array_values($existing);
+usort($savedList, function ($a, $b) {
+    $ai = isset($a['issueNumber']) ? intval($a['issueNumber']) : 0;
+    $bi = isset($b['issueNumber']) ? intval($b['issueNumber']) : 0;
+    return $bi <=> $ai; // descending
+});
+
+// Persist history atomically
+$toSave = [
+    'total_record' => count($savedList),
+    'data' => ['list' => $savedList]
+];
+$json = json_encode($toSave, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+if ($json === false) {
+    // Shouldn't typically happen, but handle it.
+    respond(['error' => 'Failed to encode JSON for saving: ' . json_last_error_msg()], 500);
+}
+
+if (@file_put_contents($tempSaveFile, $json, LOCK_EX) === false || !@rename($tempSaveFile, $saveFile)) {
+    // Clean up temp file if rename failed
+    @unlink($tempSaveFile);
+    respond(['error' => 'Failed to write history file'], 500);
+}
+
+// Return live data (as the original did) with total_record based on saved history
+respond([
+    'total_record' => count($savedList),
+    'data' => ['list' => $liveList]
+], 200);
